@@ -1,4 +1,4 @@
-# REVELATION 1.0.0
+# REVELATION 1.1.0
 
 **THE TRINITYKNOBS COLLECTION**  
 By **TRIPLE SEVEN AUDIO**  
@@ -7,7 +7,7 @@ Mastering finisher
 ## What's in the download
 
 ```
-REVELATION-1.0.0/
+REVELATION-1.1.0/
 ├── INSTALL.md            ← this guide
 ├── macOS/
 │   ├── VST3/REVELATION.vst3
@@ -55,6 +55,7 @@ xattr -dr com.apple.quarantine "$HOME/Library/Audio/Plug-Ins/Components/REVELATI
 - **LOUD** drives the mix up to +10 dB into a soft clipper and a lookahead peak limiter with a −1 dBFS ceiling. The **GR** readout under the knob shows how much the limiter is working. At 0% the limiter is off.
 - **MIX** (the slider under the preset bar) blends the processed signal with the dry input. 100% is fully wet. Double-click it to return to 100%.
 - **MATCH** turns the processed result down to your input's loudness, so you can judge the tone without being fooled by "louder sounds better". Turn it **off** before you bounce, or your master won't get louder.
+- **WAVEFORM** (bottom panel) shows the last 8 seconds of REVELATION's output, left channel in gold and right in blue, so you can see exactly what LOUD is doing to your peaks. The readout on the right shows your DAW's playhead position while the transport runs.
 - Presets: **Init**, **Streaming Ready**, **Club Weight**, **Airy Polish**, **Loud & Proud**. The disk icon saves a `.t7apreset` file and **••• → Open preset file** loads one. **••• → Bypass** toggles the plugin's bypass. Your DAW project recalls every control.
 
 REVELATION adds about 1.5 ms of latency for its limiter lookahead and reports it to your DAW, which compensates automatically. At Init (all knobs at 0%) it passes audio through unchanged.

@@ -1,5 +1,6 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <BinaryData.h>
+#include <cstdint>
 #include "Engine.h"
 
 namespace
@@ -14,6 +15,83 @@ constexpr std::array<std::array<float, 3>, 5> presets{{
 const auto accentWeight = Colour(0xffffa940);
 const auto accentSheen = Colour(0xff9fe3ff);
 const auto accentLoud = Colour(0xffff6b5e);
+
+// The audio thread publishes packed stereo min/max bins covering the last eight seconds of output.
+class OutputScope
+{
+public:
+    static constexpr size_t columns = 724;
+    static constexpr double seconds = 8.0;
+    using Frame = std::array<uint64_t, columns>;
+
+    void prepare(double rate)
+    {
+        samplesPerColumn = jmax(1, roundToInt(rate * seconds / static_cast<double>(columns)));
+        remaining = samplesPerColumn;
+        low = {1.0f, 1.0f};
+        high = {-1.0f, -1.0f};
+    }
+
+    void push(const AudioBuffer<float>& buffer)
+    {
+        if (!visible.load(std::memory_order_relaxed))
+            return;
+
+        const auto* left = buffer.getReadPointer(0);
+        const auto* right = buffer.getReadPointer(buffer.getNumChannels() > 1 ? 1 : 0);
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            const std::array samples{left[i], right[i]};
+            for (size_t channel = 0; channel < samples.size(); ++channel)
+            {
+                low[channel] = jmin(low[channel], samples[channel]);
+                high[channel] = jmax(high[channel], samples[channel]);
+            }
+            if (--remaining != 0)
+                continue;
+
+            const auto pack = [](float sample) -> uint64_t {
+                return static_cast<uint64_t>(roundToInt((jlimit(-1.0f, 1.0f, sample) + 1.0f) * 32767.0f));
+            };
+            const auto bin = pack(low[0]) | (pack(high[0]) << 16)
+                           | (pack(low[1]) << 32) | (pack(high[1]) << 48);
+            history[written % history.size()].store(bin, std::memory_order_relaxed);
+            published.store(++written, std::memory_order_release);
+            remaining = samplesPerColumn;
+            low = {1.0f, 1.0f};
+            high = {-1.0f, -1.0f};
+        }
+    }
+
+    bool read(Frame& frame, uint64_t& previous) const
+    {
+        const auto end = published.load(std::memory_order_acquire);
+        if (end == previous)
+            return false;
+        const auto begin = jmax(previous, end > columns ? end - columns : uint64_t{0});
+        const auto size = static_cast<size_t>(end - begin);
+        std::move(frame.begin() + size, frame.end(), frame.begin());
+        for (size_t i = 0; i < size; ++i)
+            frame[columns - size + i] = history[(begin + i) % history.size()].load(std::memory_order_relaxed);
+        previous = end;
+        return true;
+    }
+
+    static float sample(uint64_t bin, size_t slot)
+    {
+        return static_cast<float>((bin >> (slot * 16)) & 0xffff) / 32767.0f - 1.0f;
+    }
+
+    static constexpr uint64_t silence = 0x7fff7fff7fff7fffULL;
+    std::atomic<bool> visible{false};
+
+private:
+    std::array<std::atomic<uint64_t>, columns * 4> history{};
+    std::atomic<uint64_t> published{};
+    uint64_t written{};
+    std::array<float, 2> low{1.0f, 1.0f}, high{-1.0f, -1.0f};
+    int samplesPerColumn{22}, remaining{22};
+};
 
 class Processor final : public AudioProcessor
 {
@@ -65,6 +143,7 @@ public:
     void prepareToPlay(double rate, int) override
     {
         engine.prepare(rate, controls());
+        scope.prepare(rate);
         setLatencySamples(engine.latency());
     }
     void releaseResources() override {}
@@ -92,6 +171,11 @@ public:
         if (hostBypass)
             target.bypass = 1.0f;
         engine.process(buffer.getWritePointer(0), stereo ? buffer.getWritePointer(1) : nullptr, count, target);
+        scope.push(buffer);
+        if (auto* head = getPlayHead())
+            if (const auto position = head->getPosition())
+                if (const auto seconds = position->getTimeInSeconds())
+                    playheadSeconds.store(*seconds, std::memory_order_relaxed);
         publish(outputPeak, peak());
         publish(reduction, engine.gainReductionDb());
     }
@@ -160,6 +244,8 @@ public:
 
     AudioProcessorValueTreeState state;
     std::atomic<float> inputPeak{}, outputPeak{}, reduction{};
+    OutputScope scope;
+    std::atomic<double> playheadSeconds{-1.0};
 
 private:
     revelation::Controls controls() const
@@ -174,27 +260,9 @@ private:
     std::atomic<float>* match{};
 };
 
-Image loadLogo()
-{
-    auto original = ImageFileFormat::loadFrom(BinaryData::mark_png, BinaryData::mark_pngSize);
-    if (!original.isValid())
-        return {};
-    original = original.rescaled(320, roundToInt(320.0f * original.getHeight() / original.getWidth()));
-    Image logo(Image::ARGB, original.getWidth(), original.getHeight(), true);
-    for (int y = 0; y < logo.getHeight(); ++y)
-        for (int x = 0; x < logo.getWidth(); ++x)
-        {
-            const auto mask = original.getPixelAt(x, y).getBrightness();
-            const auto metal = Colour(0xfffff6e4).interpolatedWith(Colour(0xff7a6a52), 0.15f + 0.55f * y / logo.getHeight());
-            logo.setPixelAt(x, y, metal.withAlpha(jlimit(0.0f, 0.86f, (mask - 0.10f) * 0.96f)));
-        }
-    return logo;
-}
-
 class KnobLook final : public LookAndFeel_V4
 {
 public:
-    KnobLook() : logo(loadLogo()) {}
 
     void drawButtonText(Graphics& g, TextButton& button, bool, bool) override
     {
@@ -241,16 +309,19 @@ public:
         if (button.getButtonText() == "MATCH")
         {
             const auto on = button.getToggleState();
-            g.setColour(on ? Colour(0xffffcf7a) : Colour(0xff15120f).withAlpha(over ? 1.0f : 0.9f));
+            g.setColour(on ? Colour(0xffffcf7a) : Colour(0xff100e0c).brighter(over ? 0.1f : 0.0f));
             g.fillRoundedRectangle(bounds, radius);
-            g.setColour(on ? Colour(0xfffff1d0) : Colour(0x88f4e4c8));
+            g.setColour(on ? Colour(0xfffff1d0) : Colour(0xc0c9a46a));
             g.drawRoundedRectangle(bounds, radius, 1.2f);
             return;
         }
-        g.setColour(Colour(0xff120f0c).brighter(down ? 0.25f : (over ? 0.12f : 0.0f)));
-        g.fillRoundedRectangle(bounds, jmin(radius, 12.0f));
-        g.setColour(Colour(0x66f4e4c8));
-        g.drawRoundedRectangle(bounds, jmin(radius, 12.0f), 1.2f);
+        const auto text = button.getButtonText();
+        const auto corner = text == "SAVE" ? 11.0f : radius;
+        g.setGradientFill(ColourGradient(Colour(0xff1d1915).brighter(down ? 0.25f : (over ? 0.12f : 0.0f)), 0, bounds.getY(),
+                                         Colour(0xff0b0a09), 0, bounds.getBottom(), false));
+        g.fillRoundedRectangle(bounds, corner);
+        g.setColour(Colour(0xc0c9a46a));
+        g.drawRoundedRectangle(bounds.reduced(0.5f), corner, 1.4f);
     }
 
     int getSliderThumbRadius(Slider& slider) override
@@ -300,59 +371,32 @@ public:
     void drawRotarySlider(Graphics& g, int x, int y, int w, int h, float position,
                           float start, float end, Slider& slider) override
     {
-        const auto scale = static_cast<float>(jmin(w, h)) / 390.0f;
+        // Bounds are 400 x 400 design units centred on the knob drawn in the artwork.
+        const auto scale = static_cast<float>(jmin(w, h)) / 400.0f;
         Graphics::ScopedSaveState save(g);
-        g.addTransform(AffineTransform::scale(scale).translated(x + (w - 390 * scale) * 0.5f,
-                                                                 y + (h - 390 * scale) * 0.5f));
+        g.addTransform(AffineTransform::scale(scale).translated(x + (w - 400 * scale) * 0.5f,
+                                                                 y + (h - 400 * scale) * 0.5f));
         const auto accent = slider.findColour(Slider::rotarySliderFillColourId);
-        const Point<float> c{195, 195};
-        const auto disc = [c](float r) { return Rectangle<float>(2 * r, 2 * r).withCentre(c); };
-        const auto fill = [&](float r, Colour top, Colour bottom) {
-            g.setGradientFill(ColourGradient(top, 131, 195 - r, bottom, 253, 195 + r, false));
-            g.fillEllipse(disc(r));
-        };
-        fill(190, Colour(0xff1c1812), Colour(0xff09080a));
-        g.setColour(accent.withAlpha(0.26f));
-        g.drawEllipse(disc(184), 2);
-        fill(173, Colour(0xff6a6152), Colour(0xff0b0a0b));
-        fill(162, Colour(0xff050406), Colour(0xff17140f));
-        ColourGradient steel(Colour(0xffcdc2ad), 147, 50, Colour(0xff13110e), 259, 335, false);
-        steel.addColour(0.17, Colour(0xff57503f));
-        steel.addColour(0.45, Colour(0xff17140f));
-        steel.addColour(0.72, Colour(0xff3b3428));
-        g.setGradientFill(steel);
-        g.fillEllipse(disc(147));
-        g.setColour(Colour(0xff8c8270));
-        g.drawEllipse(disc(147), 1.4f);
-        for (int r = 77; r < 145; r += 2)
-        {
-            g.setColour(Colours::white.withAlpha(0.018f + (r % 7) * 0.003f));
-            g.drawEllipse(disc(static_cast<float>(r)), 0.7f);
-        }
-        g.setColour(Colours::black.withAlpha(0.21f));
-        g.fillEllipse(disc(87));
-        g.setOpacity(1.0f);
-        if (logo.isValid())
-            g.drawImageWithin(logo, 95, 95, 200, 200, RectanglePlacement::centred);
+        const Point<float> c{200, 200};
         const auto angle = start + position * (end - start);
         if (position > 0.0f)
         {
             Path track;
-            track.addCentredArc(c.x, c.y, 176, 176, 0, start, angle, true);
-            g.setColour(accent.withAlpha(0.23f));
-            g.strokePath(track, PathStrokeType(17, PathStrokeType::curved, PathStrokeType::rounded));
+            track.addCentredArc(c.x, c.y, 180, 180, 0, start, angle, true);
+            g.setColour(accent.withAlpha(0.22f));
+            g.strokePath(track, PathStrokeType(13, PathStrokeType::curved, PathStrokeType::rounded));
             g.setColour(accent);
-            g.strokePath(track, PathStrokeType(5, PathStrokeType::curved, PathStrokeType::rounded));
+            g.strokePath(track, PathStrokeType(4, PathStrokeType::curved, PathStrokeType::rounded));
         }
-        const auto inner = c.getPointOnCircumference(130.0f, angle);
-        const auto outer = c.getPointOnCircumference(168.0f, angle);
-        g.setColour(accent.withAlpha(0.45f));
-        g.drawLine({inner, outer}, 15);
-        g.setColour(accent.interpolatedWith(Colours::white, 0.78f));
-        g.drawLine({inner, outer}, 6);
+        const auto inner = c.getPointOnCircumference(116.0f, angle);
+        const auto outer = c.getPointOnCircumference(150.0f, angle);
+        g.setColour(accent.withAlpha(0.5f));
+        g.drawLine({inner, outer}, 13);
+        g.setColour(accent);
+        g.drawLine({inner, outer}, 9);
+        g.setColour(Colours::white.withAlpha(0.95f));
+        g.drawLine({inner, outer}, 4.5f);
     }
-private:
-    Image logo;
 };
 
 class Editor final : public AudioProcessorEditor, private Timer
@@ -419,15 +463,18 @@ public:
         save.onClick = [this] { presetFile(true); };
         menu.onClick = [this] { showOptions(); };
         setResizable(true, true);
-        getConstrainer()->setFixedAspectRatio(1672.0 / 941.0);
-        setResizeLimits(760, 428, 1672, 941);
-        setSize(1003, 565);
+        getConstrainer()->setFixedAspectRatio(static_cast<double>(designWidth) / designHeight);
+        setResizeLimits(760, 429, 1670, 942);
+        setSize(1002, 565);
         updateDisplay();
+        scopeFrame.fill(OutputScope::silence);
+        processor.scope.visible.store(true, std::memory_order_relaxed);
         startTimerHz(30);
     }
 
     ~Editor() override
     {
+        processor.scope.visible.store(false, std::memory_order_relaxed);
         stopTimer();
         for (auto& knob : knobs)
             knob.setLookAndFeel(nullptr);
@@ -440,14 +487,14 @@ public:
     void resized() override
     {
         for (size_t i = 0; i < knobs.size(); ++i)
-            knobs[i].setBounds(region(centres[i] - 195, 263, 390, 390));
-        prev.setBounds(region(1271, 98, 42, 45));
-        preset.setBounds(region(1313, 98, 159, 45));
-        next.setBounds(region(1472, 98, 42, 45));
-        save.setBounds(region(1532, 98, 45, 45));
-        menu.setBounds(region(1588, 98, 45, 45));
-        mixSlider.setBounds(region(1330, 156, 160, 44));
-        matchButton.setBounds(region(1548, 162, 78, 32));
+            knobs[i].setBounds(region(centres[i] - 200, knobY - 200, 400, 400));
+        prev.setBounds(region(1238, 99, 42, 42));
+        preset.setBounds(region(1283, 99, 187, 43));
+        next.setBounds(region(1470, 99, 42, 42));
+        save.setBounds(region(1530, 99, 44, 43));
+        menu.setBounds(region(1587, 99, 44, 43));
+        mixSlider.setBounds(region(1310, 156, 166, 44));
+        matchButton.setBounds(region(1543, 162, 81, 31));
     }
 
     void paint(Graphics& g) override
@@ -456,30 +503,32 @@ public:
         g.setImageResamplingQuality(Graphics::highResamplingQuality);
         if (artwork.isValid())
             g.drawImage(artwork, getLocalBounds().toFloat());
-        g.addTransform(AffineTransform::scale(getWidth() / 1672.0f, getHeight() / 941.0f));
+        g.addTransform(AffineTransform::scale(getWidth() / static_cast<float>(designWidth), getHeight() / static_cast<float>(designHeight)));
 
-        const Rectangle<float> mixPill(1271, 156, 362, 44);
-        g.setColour(Colour(0xd00c0a08));
+        drawScope(g);
+
+        const Rectangle<float> mixPill(1238, 156, 394, 44);
+        g.setColour(Colour(0xff0d0c0a));
         g.fillRoundedRectangle(mixPill, 22);
-        g.setColour(Colour(0x66f4e4c8));
-        g.drawRoundedRectangle(mixPill, 22, 1.2f);
-        g.setColour(Colour(0xfffff3e0));
-        g.setFont(FontOptions(16.0f).withKerningFactor(0.18f));
-        g.drawText("MIX", Rectangle<float>(1288, 156, 44, 44), Justification::centredLeft);
+        g.setColour(Colour(0xc0c9a46a));
+        g.drawRoundedRectangle(mixPill.reduced(0.5f), 22, 1.4f);
+        g.setColour(Colour(0xfff1e6d2));
+        g.setFont(FontOptions(16.0f).withKerningFactor(0.3f));
+        g.drawText("MIX", Rectangle<float>(1258, 156, 50, 44), Justification::centredLeft);
         g.setFont(FontOptions(15.0f).withStyle("Bold"));
-        g.drawText(String(roundToInt(mixSlider.getValue())) + "%", Rectangle<float>(1490, 156, 52, 44),
+        g.drawText(String(roundToInt(mixSlider.getValue())) + "%", Rectangle<float>(1478, 156, 58, 44),
                    Justification::centred);
 
-        meter(g, 53, in);
-        meter(g, 1544, out);
+        meter(g, 51, in);
+        meter(g, 1542, out);
         g.setFont(FontOptions(23.0f).withStyle("Bold"));
         for (size_t i = 0; i < knobs.size(); ++i)
         {
-            const Rectangle<float> badge(static_cast<float>(centres[i] - 42), 708, 84, 32);
-            g.setColour(Colour(0xec0f0c09));
-            g.fillRoundedRectangle(badge, 7);
-            g.setColour(Colour(0xffcdb894));
-            g.drawRoundedRectangle(badge, 7, 1);
+            const Rectangle<float> badge(static_cast<float>(centres[i] - 43), 641, 86, 32);
+            g.setColour(Colour(0xff0e0c0a));
+            g.fillRoundedRectangle(badge, 6);
+            g.setColour(Colour(0xd0c9a46a));
+            g.drawRoundedRectangle(badge.reduced(0.5f), 6, 1.3f);
             g.setColour(Colour(0xfffff6e8));
             g.drawText(String(roundToInt(knobs[i].getValue())) + "%", badge, Justification::centred);
         }
@@ -488,15 +537,15 @@ public:
             g.setFont(FontOptions(15.0f).withKerningFactor(0.12f));
             g.setColour(gainReduction > 0.05f ? accentLoud.interpolatedWith(Colours::white, 0.35f) : Colour(0xa0fff3e0));
             g.drawText("GR  -" + String(gainReduction, 1) + " dB",
-                       Rectangle<float>(static_cast<float>(centres[2] - 90), 744, 180, 22), Justification::centred);
+                       Rectangle<float>(static_cast<float>(centres[2] + 52), 641, 130, 32), Justification::centredLeft);
         }
         if (processor.getBypassParameter()->getValue() >= 0.5f)
         {
             g.setColour(Colour(0xff15110c));
-            g.fillRoundedRectangle(761, 228, 150, 34, 6);
+            g.fillRoundedRectangle(759, 694, 150, 24, 5);
             g.setColour(Colour(0xffffd9a0));
-            g.setFont(FontOptions(23.0f).withStyle("Bold"));
-            g.drawText("BYPASSED", 761, 228, 150, 34, Justification::centred);
+            g.setFont(FontOptions(17.0f).withStyle("Bold"));
+            g.drawText("BYPASSED", 759, 694, 150, 24, Justification::centred);
         }
     }
 
@@ -504,21 +553,81 @@ private:
     Rectangle<int> region(int x, int y, int w, int h) const
     {
         return Rectangle<float>(x, y, w, h).transformedBy(
-            AffineTransform::scale(getWidth() / 1672.0f, getHeight() / 941.0f)).toNearestInt();
+            AffineTransform::scale(getWidth() / static_cast<float>(designWidth), getHeight() / static_cast<float>(designHeight))).toNearestInt();
+    }
+
+    void drawScope(Graphics& g)
+    {
+        // Freeze the last picture when audio stops (hosts often stop calling processBlock).
+        processor.scope.read(scopeFrame, scopePosition);
+
+        const Rectangle<float> graph(137, 721, 1446, 134);
+        g.setColour(Colour(0xff1c1813));
+        for (int i = 0; i <= 80; ++i)
+        {
+            const auto gx = graph.getX() + graph.getWidth() * static_cast<float>(i) / 80.0f;
+            g.setColour(i % 10 == 0 ? Colour(0xff3a3020) : Colour(0xff1b1814));
+            g.drawVerticalLine(roundToInt(gx), graph.getY(), graph.getBottom());
+        }
+        g.setColour(Colour(0xff8c6c3e));
+        g.drawHorizontalLine(856, graph.getX(), graph.getRight());
+
+        g.setFont(FontOptions(13.0f).withKerningFactor(0.06f));
+        g.setColour(Colour(0xffd8c8aa));
+        for (int i = 0; i <= 8; ++i)
+        {
+            const auto gx = graph.getX() + graph.getWidth() * static_cast<float>(i) / 8.0f;
+            const String label = i == 8 ? "NOW" : "-" + String(8 - i) + "s";
+            g.drawText(label, Rectangle<float>(gx - 30, 860, 60, 18), Justification::centred);
+        }
+
+        const auto seconds = processor.playheadSeconds.load(std::memory_order_relaxed);
+        String clock = "-:--.---";
+        if (seconds >= 0.0)
+        {
+            const auto ms = static_cast<int64>(seconds * 1000.0 + 0.5);
+            clock = String(ms / 60000) + ":" + String((ms / 1000) % 60).paddedLeft('0', 2) + "."
+                  + String(ms % 1000).paddedLeft('0', 3);
+        }
+        g.setFont(FontOptions(14.0f).withKerningFactor(0.08f));
+        g.setColour(Colour(0xffe6d8be));
+        g.drawText(clock + "   /   LAST 8 SEC", Rectangle<float>(1330, 694, 254, 22), Justification::centredRight);
+
+        const std::array colours{Colour(0xfff6bd62), Colour(0xff86cff5)};
+        const std::array centres{757.5f, 819.5f};
+        for (size_t channel = 0; channel < 2; ++channel)
+        {
+            const auto center = centres[channel];
+            g.setColour(Colour(0xff2a2419));
+            g.drawHorizontalLine(roundToInt(center), graph.getX(), graph.getRight());
+            Path envelope;
+            for (size_t i = 0; i < scopeFrame.size(); ++i)
+            {
+                const auto px = graph.getX() + graph.getWidth() * static_cast<float>(i) / static_cast<float>(scopeFrame.size() - 1);
+                const auto low = OutputScope::sample(scopeFrame[i], 2 * channel);
+                const auto high = OutputScope::sample(scopeFrame[i], 2 * channel + 1);
+                envelope.startNewSubPath(px, center - high * 29.0f - 0.5f);
+                envelope.lineTo(px, center - low * 29.0f + 0.5f);
+            }
+            g.setColour(colours[channel].withAlpha(0.25f));
+            g.strokePath(envelope, PathStrokeType(3.4f));
+            g.setColour(colours[channel]);
+            g.strokePath(envelope, PathStrokeType(1.5f));
+        }
     }
 
     static void meter(Graphics& g, float x, float peak)
     {
         constexpr std::array db{-72, -60, -50, -42, -36, -33, -30, -27, -24, -22, -21, -20,
                                 -18, -17, -15, -14, -12, -11, -10, -8, -7, -6, -4, -3, -1, 0};
-        g.setColour(Colour(0xff100d0a));
-        g.fillRoundedRectangle(x - 3, 280, 34, 355, 4);
+        g.setColour(Colour(0xff0c0a08));
+        g.fillRoundedRectangle(x - 3, 272, 37, 322, 4);
         const auto level = Decibels::gainToDecibels(peak, -100.0f);
         for (size_t i = 0; i < db.size(); ++i)
         {
-            const auto lit = Colour(0xfffff3dc).interpolatedWith(Colour(0xffffa940), i / 25.0f);
-            g.setColour(level >= db[i] ? (i == db.size() - 1 ? Colour(0xffff6b5e) : lit) : Colour(0xff2a2219));
-            g.fillRoundedRectangle(x, 624.0f - 13.55f * i, 28, 8.5f, 1.5f);
+            const auto lit = Colour(0xfffff1d6).interpolatedWith(Colour(0xfff0a43a), 1.0f - i / 25.0f);
+            g.setColour(level >= db[i] ? (i == db.size() - 1 ? Colour(0xffff6b5e) : lit) : Colour(0xff3a2f1e));
+            g.fillRoundedRectangle(x, 581.0f - 12.16f * static_cast<float>(i), 31, 8, 1.5f);
         }
     }
 
@@ -620,7 +729,8 @@ private:
     const Image artwork;
     KnobLook look;
     TooltipWindow tooltips{this, 700};
-    static constexpr std::array centres{397, 840, 1282};
+    static constexpr int designWidth = 1670, designHeight = 942, knobY = 407;
+    static constexpr std::array centres{400, 834, 1272};
     std::array<Slider, 3> knobs;
     std::array<std::unique_ptr<AudioProcessorValueTreeState::SliderAttachment>, 3> attachments;
     Slider mixSlider;
@@ -630,6 +740,8 @@ private:
     TextButton prev{"<"}, preset{"INIT PRESET"}, next{">"}, save{"SAVE"}, menu{"..."};
     std::unique_ptr<FileChooser> chooser;
     float in{}, out{}, gainReduction{};
+    OutputScope::Frame scopeFrame{};
+    uint64_t scopePosition{};
 };
 
 AudioProcessorEditor* Processor::createEditor() { return new Editor(*this); }
