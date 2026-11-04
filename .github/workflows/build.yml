@@ -1,0 +1,124 @@
+name: REVELATION build (macOS + Windows)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  VERSION: 1.0.0
+jobs:
+  windows:
+    name: Windows x64 VST3
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build Windows VST3 and tests
+        shell: pwsh
+        run: ./Build-Windows.ps1 -BuildOnly
+      - name: Verify VST3 loads and recalls state in a Windows host
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $build = 'build-windows-x64'
+          $hostTest = Resolve-Path "$build/HostTest_artefacts/Release/HostTest.exe"
+          $bundle = Resolve-Path "$build/Revelation_artefacts/Release/VST3/REVELATION.vst3"
+          & $hostTest.Path $bundle.Path
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage Windows binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist
+          Copy-Item -Recurse build-windows-x64/Revelation_artefacts/Release/VST3/REVELATION.vst3 dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: REVELATION-${{ env.VERSION }}-Windows-x64-VST3
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal VST3 + AU
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DREVELATION_TESTS=ON
+      - name: Build VST3, AU and tests
+        run: cmake --build build --config Release --parallel 4 --target Revelation_VST3 Revelation_AU DspTest HostTest
+      - name: Run DSP tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Ad-hoc sign bundles
+        run: |
+          products="$PWD/build/Revelation_artefacts/Release"
+          codesign --force --deep --sign - "$products/VST3/REVELATION.vst3"
+          codesign --force --deep --sign - "$products/AU/REVELATION.component"
+          codesign --verify --strict "$products/VST3/REVELATION.vst3"
+          codesign --verify --strict "$products/AU/REVELATION.component"
+          lipo -info "$products/VST3/REVELATION.vst3/Contents/MacOS/REVELATION"
+      - name: Verify VST3 and AU load and recall state in a host
+        timeout-minutes: 3
+        run: |
+          products="$PWD/build/Revelation_artefacts/Release"
+          host="$PWD/build/HostTest_artefacts/Release/HostTest"
+          "$host" "$products/VST3/REVELATION.vst3"
+          "$host" "$products/AU/REVELATION.component"
+      - name: Stage macOS binaries
+        run: |
+          products="build/Revelation_artefacts/Release"
+          mkdir -p dist/VST3 dist/AU
+          cp -R "$products/VST3/REVELATION.vst3" dist/VST3/
+          cp -R "$products/AU/REVELATION.component" dist/AU/
+          # ditto keeps executable bits and bundle structure intact.
+          ditto -c -k --sequesterRsrc dist REVELATION-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: REVELATION-${{ env.VERSION }}-macOS
+          path: REVELATION-macOS.zip
+          if-no-files-found: error
+
+  bundle:
+    name: Bundle macOS + Windows
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble combined download
+        run: |
+          set -euo pipefail
+          root="REVELATION-${VERSION}"
+          mkdir -p "$root/Windows" "$root/macOS"
+          cp -R "artifacts/REVELATION-${VERSION}-Windows-x64-VST3/REVELATION.vst3" "$root/Windows/"
+          unzip -q "artifacts/REVELATION-${VERSION}-macOS/REVELATION-macOS.zip" -d "$root/macOS"
+          cp INSTALL.md "$root/"
+          test -x "$root/macOS/VST3/REVELATION.vst3/Contents/MacOS/REVELATION"
+          test -x "$root/macOS/AU/REVELATION.component/Contents/MacOS/REVELATION"
+          test -f "$root/Windows/REVELATION.vst3/Contents/x86_64-win/REVELATION.vst3"
+          zip -qry "REVELATION-${VERSION}-Mac-Windows.zip" "$root"
+          unzip -l "REVELATION-${VERSION}-Mac-Windows.zip" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: REVELATION-${{ env.VERSION }}-Mac-Windows
+          path: REVELATION-${{ env.VERSION }}-Mac-Windows.zip
+          if-no-files-found: error
+      - name: Attach to the v${{ env.VERSION }} release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          file="REVELATION-${VERSION}-Mac-Windows.zip"
+          tag="v${VERSION}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$file" --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "$file" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "REVELATION ${VERSION}" \
+              --notes "macOS (universal VST3 + AU) and Windows x64 VST3 in one download. See INSTALL.md inside the ZIP."
+          fi
